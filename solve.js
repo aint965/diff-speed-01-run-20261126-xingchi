@@ -1,0 +1,414 @@
+// Fast exact drop-in for makefun-diff 1.0.0 (MIT).
+//
+// Same answer as makefun-diff 1.0.0 on every input, computed faster:
+//   - lines are interned to integer ids once per case (hash + exact compare
+//     over the raw text, no per-line substring churn), so the whole search
+//     compares ints;
+//   - the common prefix / suffix are trimmed on ids;
+//   - a windowed greedy script gives a valid upper bound Dupper on the
+//     edit distance; Myers's greedy search then runs only inside the band
+//     of diagonals that can still reach both ends within Dupper (a path on
+//     diagonal k at depth d needs at least |k - (N-M)| more edits, so a
+//     cell with d + |k - (N-M)| > Dupper cannot lie on any shortest script
+//     and is skipped — the reference's own first path to both ends is
+//     inside the band, so the script is unchanged);
+//   - the search runs over a single flat Int32Array V-history (one array
+//     per case, depth d at offset d*d) with the reference's exact rule:
+//     furthest into the old text wins, deletion wins a tie, no move past
+//     either text's end, no edge-diagonal pruning, every equal run followed
+//     to its end; the edit script is recovered by backtracking that history
+//     with the same choice rule, so the script is the reference's first
+//     path to both ends, not merely a shortest one;
+//   - the patch is built exactly as the reference builds it (3 kept lines
+//     of context, runs at most 6 kept lines apart share a hunk, deletions
+//     before insertions, "%" after a line with no newline);
+//   - nothing is kept between cases: every table is allocated fresh inside
+//     run(), so each case is answered alone. If the band ever failed to
+//     reach both ends (it cannot when the bound is valid), the search
+//     restarts unbanded rather than answering wrong.
+//
+// The hot functions (greedyUpper, myers) live at module scope so V8 keeps
+// one optimized copy across cases instead of re-optimizing a fresh closure
+// per case.
+
+// ---- a windowed greedy script: its length bounds the edit distance ----
+// Every line is consumed exactly once as a keep, a deletion or an
+// insertion, so the count is the length of a valid script, hence >= D.
+// A match is taken only when the following line confirms it, so repeated
+// lines cannot drag the alignment far off. aMid/bMid are the middle's
+// line ids, padded with sentinels (-1 / -2) that match nothing.
+function greedyUpper(aMid, bMid, N, M) {
+  const W = 64;
+  let i = 0;
+  let j = 0;
+  let edits = 0;
+  while (i < N && j < M) {
+    if (aMid[i] === bMid[j]) { i++; j++; continue; }
+    let k = -1;
+    const lim = j + W < M - 1 ? j + W : M - 1;
+    for (let t = j + 1; t <= lim; t++) {
+      if (bMid[t] === aMid[i] && (i + 1 >= N || t + 1 >= M || aMid[i + 1] === bMid[t + 1])) { k = t; break; }
+    }
+    if (k !== -1) { edits += (k - j); j = k; continue; }
+    let k2 = -1;
+    const lim2 = i + W < N - 1 ? i + W : N - 1;
+    for (let t = i + 1; t <= lim2; t++) {
+      if (aMid[t] === bMid[j] && (t + 1 >= N || j + 1 >= M || aMid[t + 1] === bMid[j + 1])) { k2 = t; break; }
+    }
+    if (k2 !== -1) { edits += (k2 - i); i = k2; continue; }
+    edits += 2;
+    i++;
+    j++;
+  }
+  edits += (N - i) + (M - j);
+  return edits;
+}
+
+// ---- Myers's forward search inside the band, or null when the band ----
+// ---- is exhausted (the bound was wrong); the caller then retries ----
+// ---- unbanded. V[d][k] is the furthest x on diagonal k with d edits,
+// ---- after its snake; -1 when no path. One flat array, depth d at
+// ---- offset d*d, diagonal k at +k+d.
+function myers(aMid, bMid, N, M, Dupper) {
+  const K0 = N - M;
+  const pre = Math.min(Dupper, 6000) + 2;
+  let cap = pre * pre;
+  let V = new Int32Array(cap);
+  let D = -1;
+  for (let d = 0; D === -1; d++) {
+    if (d > Dupper) return null;
+    const need = (d + 1) * (d + 1);
+    if (need > cap) {
+      let nc = cap;
+      while (nc < need) nc *= 2;
+      const nV = new Int32Array(nc);
+      nV.set(V);
+      V = nV;
+      cap = nc;
+    }
+    const base = d * d;
+    const slack = Dupper - d;
+    let klo = K0 - slack;
+    if (klo < -d) klo = -d;
+    let khi = K0 + slack;
+    if (khi > d) khi = d;
+    if (((klo - d) & 1) !== 0) klo++;
+    if (d === 0) {
+      let x = 0;
+      let y = 0;
+      while (aMid[x] === bMid[y]) { x++; y++; }
+      V[0] = x;
+      if (x === N && y === M) D = 0;
+      continue;
+    }
+    const prevBase = (d - 1) * (d - 1);
+    let k = klo;
+    // k == -d: insertion only, from diagonal -d+1.
+    if (k === -d) {
+      const xp = V[prevBase];
+      if (xp >= 0 && xp + d - 1 < M) {
+        let x = xp;
+        let y = x + d;
+        while (aMid[x] === bMid[y]) { x++; y++; }
+        V[base] = x;
+        if (x === N && y === M) { D = d; break; }
+      } else V[base] = -1;
+      k += 2;
+    }
+    // Middle cells: both candidates live, indices in range.
+    const kMidEnd = khi === d ? khi - 2 : khi;
+    let ii = prevBase + k + d - 2;
+    let iw = base + k + d;
+    for (; k <= kMidEnd; k += 2) {
+      const xm = V[ii];
+      const xp = V[ii + 2];
+      ii += 2;
+      const canRemove = xm >= 0 && xm < N;
+      const canAdd = xp >= 0 && xp - k - 1 < M;
+      if (!canRemove && !canAdd) { V[iw] = -1; iw += 2; continue; }
+      // Furthest into the old text wins; deletion wins a tie.
+      let x;
+      if (canRemove && (!canAdd || xm + 1 >= xp)) x = xm + 1;
+      else x = xp;
+      let y = x - k;
+      while (aMid[x] === bMid[y]) { x++; y++; }
+      V[iw] = x;
+      iw += 2;
+      if (x === N && y === M) { D = d; break; }
+    }
+    if (D !== -1) break;
+    // k == d: deletion only, from diagonal d-1.
+    if (khi === d) {
+      const xm = V[prevBase + 2 * d - 2];
+      if (xm >= 0 && xm < N) {
+        let x = xm + 1;
+        let y = x - d;
+        while (aMid[x] === bMid[y]) { x++; y++; }
+        V[base + 2 * d] = x;
+        if (x === N && y === M) D = d;
+      } else V[base + 2 * d] = -1;
+    }
+  }
+  return D === -1 ? null : { D, V };
+}
+
+/** makefun-diff 1.0.0's answer for one case's input. */
+export function run(input) {
+  if (input === null || typeof input !== 'object' || typeof input.old !== 'string' || typeof input.new !== 'string') {
+    throw new TypeError('makefun-diff: the input is { old, new }, two strings');
+  }
+  const oldText = input.old;
+  const newText = input.new;
+
+  // ---- intern every line of both texts to an integer id (this case only) ----
+  // Lines are split by the native split('\n'); a line is its part plus
+  // whether it ends in "\n" (the last line of a text may not), which is
+  // exactly what makes two lines equal.
+  const map = new Map();
+  let capE = 4096;
+  let eSrc = new Int32Array(capE);
+  let eStart = new Int32Array(capE);
+  let eEnd = new Int32Array(capE);
+  let eNext = new Int32Array(capE);
+  let eId = new Int32Array(capE);
+  let eNL = new Int32Array(capE);
+  let eCount = 0;
+  let nextId = 0;
+
+  function intern(src, s, start, end, hasNL) {
+    let h = 0x811c9dc5;
+    for (let i = start; i < end; i++) {
+      h ^= s.charCodeAt(i);
+      h = Math.imul(h, 0x01000193);
+    }
+    h ^= hasNL ? 0x9e3779b9 : 0x85ebca6b;
+    h ^= h >>> 16;
+    h = Math.imul(h, 0x7feb352d);
+    h ^= h >>> 15;
+    h >>>= 0;
+    const len = end - start;
+    let head = map.get(h);
+    if (head === undefined) head = -1;
+    for (let e = head; e !== -1; e = eNext[e]) {
+      if (eNL[e] !== (hasNL ? 1 : 0) || eEnd[e] - eStart[e] !== len) continue;
+      const es = eSrc[e] === 0 ? oldText : newText;
+      const es0 = eStart[e];
+      let ok = true;
+      for (let j = 0; j < len; j++) {
+        if (es.charCodeAt(es0 + j) !== s.charCodeAt(start + j)) { ok = false; break; }
+      }
+      if (ok) return eId[e];
+    }
+    if (eCount === capE) {
+      const nc = capE * 2;
+      let t = new Int32Array(nc); t.set(eSrc); eSrc = t;
+      t = new Int32Array(nc); t.set(eStart); eStart = t;
+      t = new Int32Array(nc); t.set(eEnd); eEnd = t;
+      t = new Int32Array(nc); t.set(eNext); eNext = t;
+      t = new Int32Array(nc); t.set(eId); eId = t;
+      t = new Int32Array(nc); t.set(eNL); eNL = t;
+      capE = nc;
+    }
+    const e = eCount++;
+    eSrc[e] = src;
+    eStart[e] = start;
+    eEnd[e] = end;
+    eId[e] = nextId;
+    eNL[e] = hasNL ? 1 : 0;
+    eNext[e] = head;
+    map.set(h, e);
+    return nextId++;
+  }
+
+  // A text's lines: ids, and each line's [start, end) in the text (end just
+  // past the "\n" when there is one). The empty text has no lines.
+  function tokenize(src, s) {
+    const parts = s.split('\n');
+    const last = parts.length - 1;
+    const n = last + (parts[last] !== '' ? 1 : 0);
+    const ids = new Int32Array(n);
+    const starts = new Int32Array(n);
+    const ends = new Int32Array(n);
+    let start = 0;
+    for (let i = 0; i < last; i++) {
+      const part = parts[i];
+      ids[i] = intern(src, s, start, start + part.length, true);
+      starts[i] = start;
+      ends[i] = start + part.length + 1;
+      start += part.length + 1;
+    }
+    if (parts[last] !== '') {
+      const part = parts[last];
+      ids[last] = intern(src, s, start, start + part.length, false);
+      starts[last] = start;
+      ends[last] = start + part.length;
+    }
+    return { ids, starts, ends, text: s };
+  }
+
+  const A = tokenize(0, oldText);
+  const B = tokenize(1, newText);
+  const aIds = A.ids;
+  const bIds = B.ids;
+  const n = aIds.length;
+  const m = bIds.length;
+
+  // ---- common prefix, then common suffix of what is left ----
+  let prefix = 0;
+  while (prefix < n && prefix < m && aIds[prefix] === bIds[prefix]) prefix++;
+  let suffix = 0;
+  while (suffix < n - prefix && suffix < m - prefix && aIds[n - 1 - suffix] === bIds[m - 1 - suffix]) suffix++;
+  const N = n - prefix - suffix;
+  const M = m - prefix - suffix;
+  const po = prefix;
+  const qo = prefix;
+
+  // ---- the middle's lines, padded with sentinels that match nothing ----
+  // aMid[N] is -1, bMid[M] is -2, so a snake stops exactly at either end.
+  const aMid = new Int32Array(N + 1);
+  aMid.set(aIds.subarray(po, po + N));
+  aMid[N] = -1;
+  const bMid = new Int32Array(M + 1);
+  bMid.set(bIds.subarray(qo, qo + M));
+  bMid[M] = -2;
+
+  // ---- the middle's runs: kind 0 keep, 1 delete, 2 insert (forward order) ----
+  const rk = [];
+  const rc = [];
+  function pushRun(kind, count) {
+    if (count <= 0) return;
+    const L = rk.length;
+    if (L > 0 && rk[L - 1] === kind) rc[L - 1] += count;
+    else { rk.push(kind); rc.push(count); }
+  }
+
+  if (N === 0 && M === 0) {
+    // nothing between the prefix and the suffix
+  } else if (N === 0) {
+    rk.push(2); rc.push(M);
+  } else if (M === 0) {
+    rk.push(1); rc.push(N);
+  } else {
+    let found = myers(aMid, bMid, N, M, greedyUpper(aMid, bMid, N, M));
+    if (found === null) found = myers(aMid, bMid, N, M, N + M);
+    if (found === null) throw new Error('makefun-diff: the search ended without reaching both ends');
+    const V = found.V;
+    const D = found.D;
+
+    // Backtrack the same choices from (N, M) at depth D, collecting runs
+    // in reverse, then flip them into forward order.
+    const bk = [];
+    const bc = [];
+    function pushRev(kind, count) {
+      if (count <= 0) return;
+      const L = bk.length;
+      if (L > 0 && bk[L - 1] === kind) bc[L - 1] += count;
+      else { bk.push(kind); bc.push(count); }
+    }
+    let x = N;
+    let y = M;
+    let d = D;
+    while (d > 0) {
+      const k = x - y;
+      const prevBase = (d - 1) * (d - 1);
+      const xm = k > -d ? V[prevBase + k + d - 2] : -1;
+      const xp = k < d ? V[prevBase + k + d] : -1;
+      const canRemove = xm >= 0 && xm < N;
+      const canAdd = xp >= 0 && xp - k - 1 < M;
+      let del;
+      if (canRemove && (!canAdd || xm + 1 >= xp)) del = true;
+      else if (canAdd) del = false;
+      else throw new Error('makefun-diff: backtrack found no predecessor');
+      let x0;
+      let y0;
+      if (del) { x0 = xm + 1; y0 = xm - (k - 1); }
+      else { x0 = xp; y0 = xp - (k + 1) + 1; }
+      let s = 0;
+      while (x > x0 && y > y0) { x--; y--; s++; }
+      pushRev(0, s);
+      if (del) { pushRev(1, 1); x--; }
+      else { pushRev(2, 1); y--; }
+      d--;
+    }
+    pushRev(0, x);
+    for (let i = bk.length - 1; i >= 0; i--) pushRun(bk[i], bc[i]);
+  }
+
+  // ---- full runs: prefix keep, middle, suffix keep ----
+  const frk = [];
+  const frc = [];
+  function pushFull(kind, count) {
+    if (count <= 0) return;
+    const L = frk.length;
+    if (L > 0 && frk[L - 1] === kind) frc[L - 1] += count;
+    else { frk.push(kind); frc.push(count); }
+  }
+  if (prefix > 0) pushFull(0, prefix);
+  for (let i = 0; i < rk.length; i++) pushFull(rk[i], rc[i]);
+  if (suffix > 0) pushFull(0, suffix);
+
+  // ---- change runs: each a stretch of deletions and insertions ----
+  const cO = [];
+  const cP = [];
+  const cD = [];
+  const cI = [];
+  let o = 0;
+  let p = 0;
+  let deleted = 0;
+  let inserted = 0;
+  for (let i = 0; i < frk.length; i++) {
+    const kind = frk[i];
+    const count = frc[i];
+    if (kind === 0) { o += count; p += count; continue; }
+    const L = cO.length;
+    let ci = L - 1;
+    if (ci < 0 || cO[ci] + cD[ci] !== o || cP[ci] + cI[ci] !== p) {
+      cO.push(o); cP.push(p); cD.push(0); cI.push(0);
+      ci = L;
+    }
+    if (kind === 1) { cD[ci] += count; o += count; deleted += count; }
+    else { cI[ci] += count; p += count; inserted += count; }
+  }
+
+  // ---- hunks: change runs at most 6 kept lines apart share one ----
+  const hStart = [];
+  const hEnd = [];
+  for (let i = 0; i < cO.length; i++) {
+    const L = hStart.length;
+    if (L > 0) {
+      const prev = hEnd[L - 1] - 1;
+      if (cO[i] - (cO[prev] + cD[prev]) <= 6) { hEnd[L - 1] = i + 1; continue; }
+    }
+    hStart.push(i);
+    hEnd.push(i + 1);
+  }
+
+  // ---- the patch ----
+  const out = [`makefun-diff/1 old=${n} new=${m} hunks=${hStart.length} deleted=${deleted} inserted=${inserted}\n`];
+  function pushWritten(op, T, idx) {
+    const s = T.text;
+    const st = T.starts[idx];
+    const en = T.ends[idx];
+    if (s.charCodeAt(en - 1) === 10) out.push(op + s.slice(st, en));
+    else out.push(op + s.slice(st, en) + '\n%\n');
+  }
+  for (let hi = 0; hi < hStart.length; hi++) {
+    const first = hStart[hi];
+    const last = hEnd[hi] - 1;
+    const oldStart = Math.max(0, cO[first] - 3);
+    const newStart = cP[first] - (cO[first] - oldStart);
+    const after = Math.min(3, n - (cO[last] + cD[last]));
+    const oldEnd = cO[last] + cD[last] + after;
+    const newEnd = cP[last] + cI[last] + after;
+    out.push(`@ ${oldStart + 1} ${oldEnd - oldStart} ${newStart + 1} ${newEnd - newStart}\n`);
+    let at = oldStart;
+    for (let ci = first; ci <= last; ci++) {
+      for (; at < cO[ci]; at++) pushWritten('=', A, at);
+      for (let j = 0; j < cD[ci]; j++) pushWritten('-', A, cO[ci] + j);
+      for (let j = 0; j < cI[ci]; j++) pushWritten('+', B, cP[ci] + j);
+      at = cO[ci] + cD[ci];
+    }
+    for (; at < oldEnd; at++) pushWritten('=', A, at);
+  }
+  return out.join('');
+}
