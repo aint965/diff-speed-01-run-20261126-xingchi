@@ -1,9 +1,12 @@
 // Fast exact drop-in for makefun-diff 1.0.0 (MIT).
 //
 // Same answer as makefun-diff 1.0.0 on every input, computed faster:
-//   - lines are interned to integer ids once per case (hash + exact compare
-//     over the raw text, no per-line substring churn), so the whole search
-//     compares ints;
+//   - lines are interned to integer ids once per case (the part string
+//     itself is the Map key, so V8 hashes it once in C++ — hash cached in
+//     the string header — instead of a JS hash loop over every code unit),
+//     so the whole search compares ints; only the last line of a text can
+//     lack its newline, so bare lines go through a tiny separate slot and
+//     can never collide with a "\n" line;
 //   - the common prefix / suffix are trimmed on ids;
 //   - a windowed greedy script gives a valid upper bound Dupper on the
 //     edit distance; Myers's greedy search then runs only inside the band
@@ -22,14 +25,59 @@
 //   - the patch is built exactly as the reference builds it (3 kept lines
 //     of context, runs at most 6 kept lines apart share a hunk, deletions
 //     before insertions, "%" after a line with no newline);
-//   - nothing is kept between cases: every table is allocated fresh inside
-//     run(), so each case is answered alone. If the band ever failed to
-//     reach both ends (it cannot when the bound is valid), the search
-//     restarts unbanded rather than answering wrong.
+//   - nothing is kept between cases: the interning state is reset at the
+//     top of run(), and every other table is allocated fresh inside run(),
+//     so each case is answered alone. If the band ever failed to reach
+//     both ends (it cannot when the bound is valid), the search restarts
+//     unbanded rather than answering wrong.
 //
-// The hot functions (greedyUpper, myers) live at module scope so V8 keeps
-// one optimized copy across cases instead of re-optimizing a fresh closure
-// per case.
+// The hot functions (tokenize, greedyUpper, myers) live at module scope so
+// V8 keeps one optimized copy across cases instead of re-optimizing a
+// fresh closure per case.
+
+// ---- interning, module scope: V8 optimizes tokenize once, not once per ----
+// ---- case (the closures inside run() were re-created and re-optimized for
+// ---- every case). The part string itself is the Map key, so V8 hashes it
+// ---- once in C++ (hash cached in the string header) instead of a JS FNV
+// ---- loop over every code unit. Only the last line of a text can lack its
+// ---- newline, so bare lines go through a tiny separate slot (at most two
+// ---- per case) and can never collide with a "\n" line. State is reset at
+// ---- the top of run(), so nothing is kept between cases.
+const internMap = new Map();
+let internNextId = 0;
+let internBarePart = null;
+let internBareId = -1;
+
+// A text's lines: ids, and each line's [start, end) in the text (end just
+// past the "\n" when there is one). The empty text has no lines.
+function tokenize(s) {
+  const parts = s.split('\n');
+  const last = parts.length - 1;
+  const n = last + (parts[last] !== '' ? 1 : 0);
+  const ids = new Int32Array(n);
+  const starts = new Int32Array(n);
+  const ends = new Int32Array(n);
+  let start = 0;
+  for (let i = 0; i < last; i++) {
+    const part = parts[i];
+    let id = internMap.get(part);
+    if (id === undefined) { id = internNextId++; internMap.set(part, id); }
+    ids[i] = id;
+    starts[i] = start;
+    ends[i] = start + part.length + 1;
+    start += part.length + 1;
+  }
+  if (parts[last] !== '') {
+    const part = parts[last];
+    let id;
+    if (part === internBarePart) id = internBareId;
+    else { id = internNextId++; internBarePart = part; internBareId = id; }
+    ids[last] = id;
+    starts[last] = start;
+    ends[last] = start + part.length;
+  }
+  return { ids, starts, ends, text: s };
+}
 
 // ---- a windowed greedy script: its length bounds the edit distance ----
 // Every line is consumed exactly once as a keep, a deletion or an
@@ -134,7 +182,7 @@ function myers(aMid, bMid, N, M, Dupper) {
       while (aMid[x] === bMid[y]) { x++; y++; }
       V[iw] = x;
       iw += 2;
-      if (x === N && y === M) { D = d; break; }
+      if (k === K0 && x === N) { D = d; break; }
     }
     if (D !== -1) break;
     // k == d: deletion only, from diagonal d-1.
@@ -160,94 +208,14 @@ export function run(input) {
   const oldText = input.old;
   const newText = input.new;
 
-  // ---- intern every line of both texts to an integer id (this case only) ----
-  // Lines are split by the native split('\n'); a line is its part plus
-  // whether it ends in "\n" (the last line of a text may not), which is
-  // exactly what makes two lines equal.
-  const map = new Map();
-  let capE = 4096;
-  let eSrc = new Int32Array(capE);
-  let eStart = new Int32Array(capE);
-  let eEnd = new Int32Array(capE);
-  let eNext = new Int32Array(capE);
-  let eId = new Int32Array(capE);
-  let eNL = new Int32Array(capE);
-  let eCount = 0;
-  let nextId = 0;
+  // ---- fresh interning state for this case (nothing kept between cases) ----
+  internMap.clear();
+  internNextId = 0;
+  internBarePart = null;
+  internBareId = -1;
 
-  function intern(src, s, start, end, hasNL) {
-    let h = 0x811c9dc5;
-    for (let i = start; i < end; i++) {
-      h ^= s.charCodeAt(i);
-      h = Math.imul(h, 0x01000193);
-    }
-    h ^= hasNL ? 0x9e3779b9 : 0x85ebca6b;
-    h ^= h >>> 16;
-    h = Math.imul(h, 0x7feb352d);
-    h ^= h >>> 15;
-    h >>>= 0;
-    const len = end - start;
-    let head = map.get(h);
-    if (head === undefined) head = -1;
-    for (let e = head; e !== -1; e = eNext[e]) {
-      if (eNL[e] !== (hasNL ? 1 : 0) || eEnd[e] - eStart[e] !== len) continue;
-      const es = eSrc[e] === 0 ? oldText : newText;
-      const es0 = eStart[e];
-      let ok = true;
-      for (let j = 0; j < len; j++) {
-        if (es.charCodeAt(es0 + j) !== s.charCodeAt(start + j)) { ok = false; break; }
-      }
-      if (ok) return eId[e];
-    }
-    if (eCount === capE) {
-      const nc = capE * 2;
-      let t = new Int32Array(nc); t.set(eSrc); eSrc = t;
-      t = new Int32Array(nc); t.set(eStart); eStart = t;
-      t = new Int32Array(nc); t.set(eEnd); eEnd = t;
-      t = new Int32Array(nc); t.set(eNext); eNext = t;
-      t = new Int32Array(nc); t.set(eId); eId = t;
-      t = new Int32Array(nc); t.set(eNL); eNL = t;
-      capE = nc;
-    }
-    const e = eCount++;
-    eSrc[e] = src;
-    eStart[e] = start;
-    eEnd[e] = end;
-    eId[e] = nextId;
-    eNL[e] = hasNL ? 1 : 0;
-    eNext[e] = head;
-    map.set(h, e);
-    return nextId++;
-  }
-
-  // A text's lines: ids, and each line's [start, end) in the text (end just
-  // past the "\n" when there is one). The empty text has no lines.
-  function tokenize(src, s) {
-    const parts = s.split('\n');
-    const last = parts.length - 1;
-    const n = last + (parts[last] !== '' ? 1 : 0);
-    const ids = new Int32Array(n);
-    const starts = new Int32Array(n);
-    const ends = new Int32Array(n);
-    let start = 0;
-    for (let i = 0; i < last; i++) {
-      const part = parts[i];
-      ids[i] = intern(src, s, start, start + part.length, true);
-      starts[i] = start;
-      ends[i] = start + part.length + 1;
-      start += part.length + 1;
-    }
-    if (parts[last] !== '') {
-      const part = parts[last];
-      ids[last] = intern(src, s, start, start + part.length, false);
-      starts[last] = start;
-      ends[last] = start + part.length;
-    }
-    return { ids, starts, ends, text: s };
-  }
-
-  const A = tokenize(0, oldText);
-  const B = tokenize(1, newText);
+  const A = tokenize(oldText);
+  const B = tokenize(newText);
   const aIds = A.ids;
   const bIds = B.ids;
   const n = aIds.length;
