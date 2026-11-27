@@ -9,19 +9,37 @@
 //     can never collide with a "\n" line;
 //   - the common prefix / suffix are trimmed on ids;
 //   - a windowed greedy script gives a valid upper bound Dupper on the
-//     edit distance; Myers's greedy search then runs only inside the band
-//     of diagonals that can still reach both ends within Dupper (a path on
-//     diagonal k at depth d needs at least |k - (N-M)| more edits, so a
-//     cell with d + |k - (N-M)| > Dupper cannot lie on any shortest script
-//     and is skipped — the reference's own first path to both ends is
-//     inside the band, so the script is unchanged);
-//   - the search runs over a single flat Int32Array V-history (one array
-//     per case, depth d at offset d*d) with the reference's exact rule:
-//     furthest into the old text wins, deletion wins a tie, no move past
-//     either text's end, no edge-diagonal pruning, every equal run followed
-//     to its end; the edit script is recovered by backtracking that history
-//     with the same choice rule, so the script is the reference's first
-//     path to both ends, not merely a shortest one;
+//     edit distance — the best of four greedy scripts (forward/reverse x
+//     insertion-first/deletion-first), each a valid script, so the min is
+//     a valid bound and the tightest of the four; Myers's greedy search
+//     then runs only inside the band of diagonals that can still reach
+//     both ends within Dupper (a path on diagonal k at depth d needs at
+//     least |k - (N-M)| more edits, so a cell with d + |k - (N-M)| >
+//     Dupper cannot lie on any shortest script and is skipped — the
+//     reference's own first path to both ends is inside the band, so the
+//     script is unchanged);
+//   - the search runs over a COMPACT V-history: one Int32Array holding
+//     only the band (one padded segment per depth, ~19 MB for the
+//     practice cases) instead of the full d*d triangle (~78 MB, of which
+//     only ~4.7M of ~19.6M cells are ever written — touching that span
+//     costs ~20 ms per case in page faults). The pad slot on each side
+//     reads as 0, exactly like an unwritten cell of the full layout, so
+//     the search and the backtrack make the same choices; the full layout
+//     is kept as the fallback for bounds above 6000. The search keeps
+//     the reference's exact rule: furthest into the old text wins,
+//     deletion wins a tie, no move past either text's end, no
+//     edge-diagonal pruning, every equal run followed to its end; the
+//     edit script is recovered by backtracking that history with the same
+//     choice rule, so the script is the reference's first path to both
+//     ends, not merely a shortest one;
+//   - BIDIRECTIONAL Myers was measured and REJECTED (see the round's
+//     notes): with the band already in place, a bidirectional search
+//     visits 1.35-1.65x MORE cells than the forward search (the top level
+//     alone is ~77% of the forward total, and the recursion re-searches
+//     both halves — the geometric series sums to ~7.2M cells vs ~4.7M
+//     forward on the practice set, even with the best-case even splits),
+//     so it is slower, not faster. Myers's linear-space algorithm is a
+//     space optimization, not a time one.
 //   - the patch is built exactly as the reference builds it (3 kept lines
 //     of context, runs at most 6 kept lines apart share a hunk, deletions
 //     before insertions, "%" after a line with no newline);
@@ -112,6 +130,95 @@ function greedyUpper(aMid, bMid, N, M) {
   return edits;
 }
 
+// Reverse greedy (same algorithm from the end) — a different valid script,
+// sometimes tighter in repeated-run regions.
+function greedyUpperRev(aMid, bMid, N, M) {
+  const W = 64;
+  let i = N - 1;
+  let j = M - 1;
+  let edits = 0;
+  while (i >= 0 && j >= 0) {
+    if (aMid[i] === bMid[j]) { i--; j--; continue; }
+    let k = -1;
+    const lim = j - W > 0 ? j - W : 0;
+    for (let t = j - 1; t >= lim; t--) {
+      if (bMid[t] === aMid[i] && (i - 1 < 0 || t - 1 < 0 || aMid[i - 1] === bMid[t - 1])) { k = t; break; }
+    }
+    if (k !== -1) { edits += (j - k); j = k; continue; }
+    let k2 = -1;
+    const lim2 = i - W > 0 ? i - W : 0;
+    for (let t = i - 1; t >= lim2; t--) {
+      if (aMid[t] === bMid[j] && (t - 1 < 0 || j - 1 < 0 || aMid[t - 1] === bMid[j - 1])) { k2 = t; break; }
+    }
+    if (k2 !== -1) { edits += (i - k2); i = k2; continue; }
+    edits += 2;
+    i--;
+    j--;
+  }
+  edits += (i + 1) + (j + 1);
+  return edits;
+}
+
+// Forward greedy, deletion scan first (opposite scan order).
+function greedyUpperDel(aMid, bMid, N, M) {
+  const W = 64;
+  let i = 0;
+  let j = 0;
+  let edits = 0;
+  while (i < N && j < M) {
+    if (aMid[i] === bMid[j]) { i++; j++; continue; }
+    let k2 = -1;
+    const lim2 = i + W < N - 1 ? i + W : N - 1;
+    for (let t = i + 1; t <= lim2; t++) {
+      if (aMid[t] === bMid[j] && (t + 1 >= N || j + 1 >= M || aMid[t + 1] === bMid[j + 1])) { k2 = t; break; }
+    }
+    if (k2 !== -1) { edits += (k2 - i); i = k2; continue; }
+    let k = -1;
+    const lim = j + W < M - 1 ? j + W : M - 1;
+    for (let t = j + 1; t <= lim; t++) {
+      if (bMid[t] === aMid[i] && (i + 1 >= N || t + 1 >= M || aMid[i + 1] === bMid[t + 1])) { k = t; break; }
+    }
+    if (k !== -1) { edits += (k - j); j = k; continue; }
+    edits += 2;
+    i++;
+    j++;
+  }
+  edits += (N - i) + (M - j);
+  return edits;
+}
+
+// Reverse greedy, deletion scan first.
+function greedyUpperRevDel(aMid, bMid, N, M) {
+  const W = 64;
+  let i = N - 1;
+  let j = M - 1;
+  let edits = 0;
+  while (i >= 0 && j >= 0) {
+    if (aMid[i] === bMid[j]) { i--; j--; continue; }
+    let k2 = -1;
+    const lim2 = i - W > 0 ? i - W : 0;
+    for (let t = i - 1; t >= lim2; t--) {
+      if (aMid[t] === bMid[j] && (t - 1 < 0 || j - 1 < 0 || aMid[t - 1] === bMid[j - 1])) { k2 = t; break; }
+    }
+    if (k2 !== -1) { edits += (i - k2); i = k2; continue; }
+    let k = -1;
+    const lim = j - W > 0 ? j - W : 0;
+    for (let t = j - 1; t >= lim; t--) {
+      if (bMid[t] === aMid[i] && (i - 1 < 0 || t - 1 < 0 || aMid[i - 1] === bMid[t - 1])) { k = t; break; }
+    }
+    if (k !== -1) { edits += (j - k); j = k; continue; }
+    edits += 2;
+    i--;
+    j--;
+  }
+  edits += (i + 1) + (j + 1);
+  return edits;
+}
+
+// The bound is the best of the four greedy scripts (forward/reverse x
+// insertion-first/deletion-first); each is a valid script, so the min is
+// a valid upper bound, and it is the tightest of the four.
+
 // ---- Myers's forward search inside the band, or null when the band ----
 // ---- is exhausted (the bound was wrong); the caller then retries ----
 // ---- unbanded. V[d][k] is the furthest x on diagonal k with d edits,
@@ -200,6 +307,100 @@ function myers(aMid, bMid, N, M, Dupper) {
   return D === -1 ? null : { D, V };
 }
 
+// ---- Compact banded Myers: the same search, but V stores only the band ----
+// ---- (one padded segment per depth) instead of the full d*d triangle.
+// ---- V index for (d,k) = offA[d] + 1 + (k - kloA[d]) / 2; the pad slot
+// ---- on each side reads as 0, exactly like an unwritten cell of the
+// ---- full layout. The full layout spans ~78 MB for the practice cases
+// ---- (only ~4.7M of ~19.6M cells are ever written), and touching that
+// ---- span costs ~20 ms per case in page faults; the compact layout spans
+// ---- ~19 MB. Only used when Dupper <= 6000 (the practice/scored range);
+// ---- larger bounds fall back to the full layout above.
+function myersCompact(aMid, bMid, N, M, Dupper) {
+  const K0 = N - M;
+  const kloA = new Int32Array(Dupper + 2);
+  const khiA = new Int32Array(Dupper + 2);
+  const offA = new Int32Array(Dupper + 2);
+  let total = 0;
+  for (let d = 0; d <= Dupper; d++) {
+    const slack = Dupper - d;
+    let klo = K0 - slack;
+    if (klo < -d) klo = -d;
+    let khi = K0 + slack;
+    if (khi > d) khi = d;
+    if (((klo - d) & 1) !== 0) klo++;
+    kloA[d] = klo;
+    khiA[d] = khi;
+    offA[d] = total;
+    total += (khi - klo) / 2 + 1 + 2;
+  }
+  const V = new Int32Array(total);
+  let D = -1;
+  for (let d = 0; D === -1; d++) {
+    if (d > Dupper) return null;
+    const klo = kloA[d];
+    const khi = khiA[d];
+    const base = offA[d] + 1;
+    if (d === 0) {
+      let x = 0;
+      let y = 0;
+      while (aMid[x] === bMid[y]) { x++; y++; }
+      V[base] = x;
+      if (x === N && y === M) D = 0;
+      continue;
+    }
+    const prevOff = offA[d - 1] + 1;
+    const kloPrev = kloA[d - 1];
+    let k = klo;
+    // k == -d: insertion only, from diagonal -d+1.
+    if (k === -d) {
+      const xp = V[prevOff + ((-d + 1 - kloPrev) >> 1)];
+      if (xp >= 0 && xp + d - 1 < M) {
+        let x = xp;
+        let y = x + d;
+        while (aMid[x] === bMid[y]) { x++; y++; }
+        V[base] = x;
+        if (x === N && y === M) { D = d; break; }
+      } else V[base] = -1;
+      k += 2;
+    }
+    // Middle cells: both candidates live, indices in range.
+    const kMidEnd = khi === d ? khi - 2 : khi;
+    let ii = prevOff + ((k - 1 - kloPrev) >> 1);
+    let iw = base + ((k - klo) >> 1);
+    for (; k <= kMidEnd; k += 2) {
+      const xm = V[ii];
+      const xp = V[ii + 1];
+      ii += 1;
+      const canRemove = xm >= 0 && xm < N;
+      const canAdd = xp >= 0 && xp - k - 1 < M;
+      if (!canRemove && !canAdd) { V[iw] = -1; iw += 1; continue; }
+      // Furthest into the old text wins; deletion wins a tie.
+      let x;
+      if (canRemove && (!canAdd || xm + 1 >= xp)) x = xm + 1;
+      else x = xp;
+      let y = x - k;
+      while (aMid[x] === bMid[y]) { x++; y++; }
+      V[iw] = x;
+      iw += 1;
+      if (k === K0 && x === N) { D = d; break; }
+    }
+    if (D !== -1) break;
+    // k == d: deletion only, from diagonal d-1.
+    if (khi === d) {
+      const xm = V[prevOff + ((d - 1 - kloPrev) >> 1)];
+      if (xm >= 0 && xm < N) {
+        let x = xm + 1;
+        let y = x - d;
+        while (aMid[x] === bMid[y]) { x++; y++; }
+        V[base + ((d - klo) >> 1)] = x;
+        if (x === N && y === M) D = d;
+      } else V[base + ((d - klo) >> 1)] = -1;
+    }
+  }
+  return D === -1 ? null : { D, V, kloA, offA, compact: true };
+}
+
 /** makefun-diff 1.0.0's answer for one case's input. */
 export function run(input) {
   if (input === null || typeof input !== 'object' || typeof input.old !== 'string' || typeof input.new !== 'string') {
@@ -257,11 +458,22 @@ export function run(input) {
   } else if (M === 0) {
     rk.push(1); rc.push(N);
   } else {
-    let found = myers(aMid, bMid, N, M, greedyUpper(aMid, bMid, N, M));
+    const Dupper = Math.min(
+      greedyUpper(aMid, bMid, N, M),
+      greedyUpperRev(aMid, bMid, N, M),
+      greedyUpperDel(aMid, bMid, N, M),
+      greedyUpperRevDel(aMid, bMid, N, M),
+    );
+    let found = Dupper <= 6000
+      ? myersCompact(aMid, bMid, N, M, Dupper)
+      : myers(aMid, bMid, N, M, Dupper);
     if (found === null) found = myers(aMid, bMid, N, M, N + M);
     if (found === null) throw new Error('makefun-diff: the search ended without reaching both ends');
     const V = found.V;
     const D = found.D;
+    const compact = !!found.compact;
+    const kloA = found.kloA;
+    const offA = found.offA;
 
     // Backtrack the same choices from (N, M) at depth D, collecting runs
     // in reverse, then flip them into forward order.
@@ -278,9 +490,18 @@ export function run(input) {
     let d = D;
     while (d > 0) {
       const k = x - y;
-      const prevBase = (d - 1) * (d - 1);
-      const xm = k > -d ? V[prevBase + k + d - 2] : -1;
-      const xp = k < d ? V[prevBase + k + d] : -1;
+      let xm;
+      let xp;
+      if (compact) {
+        const prevOff = offA[d - 1] + 1;
+        const kloPrev = kloA[d - 1];
+        xm = k > -d ? V[prevOff + ((k - 1 - kloPrev) >> 1)] : -1;
+        xp = k < d ? V[prevOff + ((k + 1 - kloPrev) >> 1)] : -1;
+      } else {
+        const prevBase = (d - 1) * (d - 1);
+        xm = k > -d ? V[prevBase + k + d - 2] : -1;
+        xp = k < d ? V[prevBase + k + d] : -1;
+      }
       const canRemove = xm >= 0 && xm < N;
       const canAdd = xp >= 0 && xp - k - 1 < M;
       let del;
